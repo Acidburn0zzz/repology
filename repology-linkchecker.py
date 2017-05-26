@@ -102,26 +102,20 @@ def GetLinkStatuses(urls, delay, timeout):
     return results
 
 
-def LinkProcessorWorker(queue, workerid, options, logger):
-    database = Database(options.dsn, readonly=False)
+class LinkProcessor:
+    def __init__(self, delay, timeout, logger):
+        self.delay = delay
+        self.timeout = timeout
+        self.logger = logger
 
-    logger = logger.GetPrefixed('worker{}: '.format(workerid))
+    def __call__(self, urls):
+        self.logger.Log('Start processing {} urls ({} .. {})'.format(len(urls), urls[0], urls[-1]))
 
-    logger.Log('Worker spawned')
+        results = GetLinkStatuses(urls, delay=self.delay, timeout=self.timeout)
 
-    while True:
-        pack = queue.get()
-        if pack is None:
-            logger.Log('Worker exiting')
-            return
+        self.logger.Log('Done processing {} urls ({} .. {})'.format(len(urls), urls[0], urls[-1]))
 
-        logger.Log('Processing {} urls ({}..{})'.format(len(pack), pack[0], pack[-1]))
-        for result in GetLinkStatuses(pack, delay=options.delay, timeout=options.timeout):
-            url, status, redirect, size, location = result
-            database.UpdateLinkStatus(url=url, status=status, redirect=redirect, size=size, location=location)
-
-        database.Commit()
-        logger.Log('Done processing {} urls ({}..{})'.format(len(pack), pack[0], pack[-1]))
+        return results
 
 
 def Main():
@@ -144,64 +138,54 @@ def Main():
     options = parser.parse_args()
 
     logger = FileLogger(options.logfile) if options.logfile else StderrLogger()
-    database = Database(options.dsn, readonly=True, autocommit=True)
+    database = Database(options.dsn, readonly=False, autocommit=True)
 
-    queue = multiprocessing.Queue(1)
-    processpool = [multiprocessing.Process(target=LinkProcessorWorker, args=(queue, i, options, logger)) for i in range(options.jobs)]
-    for process in processpool:
-        process.start()
+    pool = multiprocessing.Pool(options.jobs)
 
-    # base logger already passed to workers, may append prefix here
-    logger = logger.GetPrefixed('master: ')
-
-    prev_url = None
-    while True:
-        # Get pack of links
-        logger.Log('Requesting pack of urls')
-        urls = database.GetLinksForCheck(
-            after=prev_url,
-            prefix=options.prefix,  # no limit by default
-            limit=options.packsize,
-            recheck_age=options.age * 60 * 60 * 24,
-            unchecked_only=options.unchecked,
-            checked_only=options.checked,
-            failed_only=options.failed,
-            succeeded_only=options.succeeded
-        )
-        if not urls:
-            logger.Log('  No more urls to process')
-            break
-
-        # Get another pack of urls with the last hostname to ensure
-        # that all urls for one hostname get into a same large pack
-        match = re.match('([a-z]+://[^/]+/)', urls[-1])
-        if match:
-            urls += database.GetLinksForCheck(
-                after=urls[-1],
-                prefix=match.group(1),
+    def LinkGenerator():
+        prev_url = None
+        while True:
+            urls = database.GetLinksForCheck(
+                after=prev_url,
+                prefix=options.prefix,  # no limit by default
+                limit=options.packsize,
                 recheck_age=options.age * 60 * 60 * 24,
                 unchecked_only=options.unchecked,
                 checked_only=options.checked,
                 failed_only=options.failed,
                 succeeded_only=options.succeeded
             )
+            if not urls:
+                logger.Log('  No more urls to process')
+                return
 
-        # Process
-        if options.maxpacksize and len(urls) > options.maxpacksize:
-            logger.Log('Skipping {} urls ({}..{}), exceeds max pack size'.format(len(urls), urls[0], urls[-1]))
-        else:
-            queue.put(urls)
-            logger.Log('Enqueued {} urls ({}..{})'.format(len(urls), urls[0], urls[-1]))
+            # Get another pack of urls with the last hostname to ensure
+            # that all urls for one hostname get into a same large pack
+            match = re.match('([a-z]+://[^/]+/)', urls[-1])
+            if match:
+                urls += database.GetLinksForCheck(
+                    after=urls[-1],
+                    prefix=match.group(1),
+                    recheck_age=options.age * 60 * 60 * 24,
+                    unchecked_only=options.unchecked,
+                    checked_only=options.checked,
+                    failed_only=options.failed,
+                    succeeded_only=options.succeeded
+                )
 
-        prev_url = urls[-1]
+            if options.maxpacksize and len(urls) > options.maxpacksize:
+                logger.Log('Skipping {} urls ({} .. {}), exceeds max pack size'.format(len(urls), urls[0], urls[-1]))
+            else:
+                logger.Log('Enqueuing {} urls ({} .. {})'.format(len(urls), urls[0], urls[-1]))
+                yield urls
 
-    logger.Log('Waiting for child processes to exit')
+            prev_url = urls[-1]
 
-    for process in processpool:
-        queue.put(None)
+    for results in pool.imap(LinkProcessor(delay=options.delay, timeout=options.timeout, logger=logger), LinkGenerator(), 1):
+        for url, status, redirect, size, location in results:
+            database.UpdateLinkStatus(url=url, status=status, redirect=redirect, size=size, location=location)
 
-    for process in processpool:
-        process.join()
+        database.Commit()
 
     logger.Log('Done')
 
